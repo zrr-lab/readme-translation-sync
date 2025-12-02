@@ -88,36 +88,62 @@ runs:
 
           // System prompt
           const systemPrompt = [
-            `You are a professional translator. Translate or update the ${targetLanguage} translation of a README.md file.`,
+            `You are a professional translator. Your task is to update the ${targetLanguage} translation of a README.md file based on incremental changes.`,
             '',
-            'Instructions:',
+            'CRITICAL OUTPUT RULES:',
+            '- Output ONLY the raw markdown content directly.',
+            '- DO NOT wrap your output in ```markdown or any other code blocks.',
+            '- DO NOT add any explanations, comments, or notes before or after the content.',
+            '- Start your response directly with the markdown content.',
+            '',
+            'Translation Instructions:',
             '- Keep all markdown formatting, code blocks, links, and technical terms intact.',
             `- Add language switch links at the top: [English](${sourceFile}) | [${targetLanguage}](${targetFile})`,
             '- Only translate natural language text, not code, URLs, or file paths.',
             '- Maintain the same structure and formatting as the original.',
-            '- Output only the translated content without any explanations.'
+            '',
+            'Incremental Update Strategy:',
+            '- Focus on the diff provided - only modify the parts that have changed.',
+            '- Preserve the existing translation for unchanged sections.',
+            '- If a section was added, translate only the new section.',
+            '- If a section was modified, update only that section\'s translation.',
+            '- If a section was deleted, remove the corresponding translation.'
           ].join('\n');
 
           // User prompt
-          const userPrompt = [
-            `## Current ${sourceFile}:`,
-            '```markdown',
-            readmeContent,
-            '```',
+          const userPrompt = existingTranslation ? [
+            '## Task: Incremental Translation Update',
+            '',
+            `The English ${sourceFile} has been updated. Please update ONLY the changed parts in the ${targetLanguage} translation.`,
             '',
             `## Changes made to ${sourceFile} (diff):`,
             '```diff',
             diffContent,
             '```',
             '',
-            existingTranslation ? [
-              `## Existing ${targetLanguage} translation (${targetFile}):`,
-              '```markdown',
-              existingTranslation,
-              '```',
-              '',
-              `Please update the ${targetLanguage} translation based on the changes shown in the diff above.`
-            ].join('\n') : `Please provide a complete ${targetLanguage} translation of the README above.`
+            `## Current English ${sourceFile} (for reference):`,
+            '```markdown',
+            readmeContent,
+            '```',
+            '',
+            `## Existing ${targetLanguage} translation (${targetFile}) - update this:`,
+            '```markdown',
+            existingTranslation,
+            '```',
+            '',
+            'IMPORTANT: Only modify the sections affected by the diff. Keep all other sections exactly as they are in the existing translation.',
+            `Output the complete updated ${targetLanguage} ${targetFile} content directly (no code blocks wrapping).`
+          ].join('\n') : [
+            '## Task: Full Translation',
+            '',
+            `No existing ${targetLanguage} translation found. Please provide a complete ${targetLanguage} translation.`,
+            '',
+            `## English ${sourceFile} to translate:`,
+            '```markdown',
+            readmeContent,
+            '```',
+            '',
+            `Output the complete ${targetLanguage} ${targetFile} content directly (no code blocks wrapping).`
           ].join('\n');
 
           // Call GitHub Models API
@@ -146,18 +172,38 @@ runs:
           const data = await response.json();
 
           if (!data.choices?.length || !data.choices[0].message?.content) {
-            core.setFailed('Invalid response from GitHub Models API');
+            core.setFailed('Invalid response from GitHub Models API: missing expected content');
             return;
           }
 
-          const translatedContent = data.choices[0].message.content;
+          let translatedContent = data.choices[0].message.content;
+
+          // Clean up potential markdown code block wrapping from AI output
+          translatedContent = translatedContent.trim();
+          if (translatedContent.startsWith('```markdown')) {
+            translatedContent = translatedContent.slice('```markdown'.length);
+          } else if (translatedContent.startsWith('```md')) {
+            translatedContent = translatedContent.slice('```md'.length);
+          } else if (translatedContent.startsWith('```')) {
+            translatedContent = translatedContent.slice('```'.length);
+          }
+          if (translatedContent.endsWith('```')) {
+            translatedContent = translatedContent.slice(0, -'```'.length);
+          }
+          translatedContent = translatedContent.trim();
+
+          // Ensure the file ends with a newline
+          if (!translatedContent.endsWith('\n')) {
+            translatedContent += '\n';
+          }
+
           fs.writeFileSync(targetFile, translatedContent);
 
           // Check for changes
           const { execSync } = require('child_process');
           try {
-            const status = execSync(`git status --porcelain ${targetFile}`).toString();
-            core.setOutput('has_changes', status ? 'true' : 'false');
+            const status = execSync(`git status --porcelain ${targetFile}`, { encoding: 'utf8' }).trim();
+            core.setOutput('has_changes', status.length > 0 ? 'true' : 'false');
           } catch {
             core.setOutput('has_changes', 'false');
           }
