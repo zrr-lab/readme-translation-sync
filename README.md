@@ -1,4 +1,5 @@
 # README Translation Sync
+English | [中文](README.zh-CN.md)
 
 A GitHub Action that automatically syncs README translations using GitHub Models AI.
 
