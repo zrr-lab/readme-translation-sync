@@ -6,7 +6,7 @@ A GitHub Action that automatically syncs README translations using GitHub Models
 ## Features
 
 - 🔄 Automatically detects changes in source README
-- 🤖 Uses GitHub Models (GPT-4o-mini) for translation
+- 🤖 Uses GitHub Models (GPT-5-mini) for translation
 - 📝 Supports incremental updates based on diffs
 - 🌍 Configurable target language and files
 

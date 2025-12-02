@@ -30,7 +30,7 @@ jobs:
           body: |
             This PR automatically syncs the Chinese translation with the latest changes in `README.md`.
 
-            Generated using GitHub Models (GPT-4o-mini).
+            Generated using GitHub Models (GPT-5-mini).
           branch: readme-translation-sync
           delete-branch: true
           labels: documentation
