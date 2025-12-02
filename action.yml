@@ -1,0 +1,163 @@
+name: "README Translation Sync"
+description: "Automatically sync README translations using GitHub Models AI"
+author: "zrr-lab"
+
+branding:
+  icon: "globe"
+  color: "blue"
+
+inputs:
+  source-file:
+    description: "Source README file to translate"
+    required: false
+    default: "README.md"
+  target-file:
+    description: "Target translated README file"
+    required: false
+    default: "README.zh-CN.md"
+  target-language:
+    description: "Target language for translation"
+    required: false
+    default: "Chinese"
+  model:
+    description: "GitHub Models model to use"
+    required: false
+    default: "openai/gpt-4o-mini"
+  github-token:
+    description: "GitHub token with models:read permission"
+    required: true
+
+outputs:
+  has-changes:
+    description: "Whether the translation has changes"
+    value: ${{ steps.translate.outputs.has_changes }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check source file changes
+      id: check
+      shell: bash
+      run: |
+        if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^${{ inputs.source-file }}$"; then
+          echo "changed=true" >> $GITHUB_OUTPUT
+          git diff HEAD~1 HEAD -- "${{ inputs.source-file }}" > "$RUNNER_TEMP/readme_diff.txt"
+          echo "diff_file=$RUNNER_TEMP/readme_diff.txt" >> $GITHUB_OUTPUT
+        else
+          echo "changed=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Translate using GitHub Models AI
+      if: steps.check.outputs.changed == 'true'
+      id: translate
+      uses: actions/github-script@v7
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        DIFF_FILE: ${{ steps.check.outputs.diff_file }}
+        SOURCE_FILE: ${{ inputs.source-file }}
+        TARGET_FILE: ${{ inputs.target-file }}
+        TARGET_LANGUAGE: ${{ inputs.target-language }}
+        MODEL: ${{ inputs.model }}
+      with:
+        script: |
+          const fs = require('fs');
+
+          const sourceFile = process.env.SOURCE_FILE;
+          const targetFile = process.env.TARGET_FILE;
+          const targetLanguage = process.env.TARGET_LANGUAGE;
+          const model = process.env.MODEL;
+
+          // Read source README
+          const readmeContent = fs.readFileSync(sourceFile, 'utf8');
+
+          // Read diff
+          let diffContent = '';
+          try {
+            diffContent = fs.readFileSync(process.env.DIFF_FILE, 'utf8');
+          } catch {
+            diffContent = 'Unable to read diff';
+          }
+
+          // Read existing translation if exists
+          let existingTranslation = '';
+          try {
+            existingTranslation = fs.readFileSync(targetFile, 'utf8');
+          } catch {
+            existingTranslation = '';
+          }
+
+          // System prompt
+          const systemPrompt = [
+            `You are a professional translator. Translate or update the ${targetLanguage} translation of a README.md file.`,
+            '',
+            'Instructions:',
+            '- Keep all markdown formatting, code blocks, links, and technical terms intact.',
+            `- Add language switch links at the top: [English](${sourceFile}) | [${targetLanguage}](${targetFile})`,
+            '- Only translate natural language text, not code, URLs, or file paths.',
+            '- Maintain the same structure and formatting as the original.',
+            '- Output only the translated content without any explanations.'
+          ].join('\n');
+
+          // User prompt
+          const userPrompt = [
+            `## Current ${sourceFile}:`,
+            '```markdown',
+            readmeContent,
+            '```',
+            '',
+            `## Changes made to ${sourceFile} (diff):`,
+            '```diff',
+            diffContent,
+            '```',
+            '',
+            existingTranslation ? [
+              `## Existing ${targetLanguage} translation (${targetFile}):`,
+              '```markdown',
+              existingTranslation,
+              '```',
+              '',
+              `Please update the ${targetLanguage} translation based on the changes shown in the diff above.`
+            ].join('\n') : `Please provide a complete ${targetLanguage} translation of the README above.`
+          ].join('\n');
+
+          // Call GitHub Models API
+          const response = await fetch('https://models.github.ai/inference/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: model,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+              ],
+              max_tokens: 8192
+            })
+          });
+
+          if (!response.ok) {
+            const error = await response.text();
+            core.setFailed(`GitHub Models API error: ${response.status} - ${error}`);
+            return;
+          }
+
+          const data = await response.json();
+
+          if (!data.choices?.length || !data.choices[0].message?.content) {
+            core.setFailed('Invalid response from GitHub Models API');
+            return;
+          }
+
+          const translatedContent = data.choices[0].message.content;
+          fs.writeFileSync(targetFile, translatedContent);
+
+          // Check for changes
+          const { execSync } = require('child_process');
+          try {
+            const status = execSync(`git status --porcelain ${targetFile}`).toString();
+            core.setOutput('has_changes', status ? 'true' : 'false');
+          } catch {
+            core.setOutput('has_changes', 'false');
+          }
