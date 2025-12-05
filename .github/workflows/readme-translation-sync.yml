@@ -1,6 +1,7 @@
 name: README Translation Sync
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -18,11 +19,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - uses: zrr-lab/readme-translation-sync@main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: peter-evans/create-pull-request@v7
         with:
           commit-message: "📝 docs: sync README.zh-CN.md translation"

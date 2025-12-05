@@ -23,14 +23,22 @@ inputs:
     description: "GitHub Models model to use"
     required: false
     default: "openai/gpt-5-mini"
-  github-token:
+  token:
     description: "GitHub token with models:read permission"
-    required: true
+    required: false
+    default: ${{ github.token }}
+  github-token:
+    description: "GitHub token with models:read permission (deprecated, use token instead)"
+    required: false
+  max-tokens:
+    description: "Maximum number of tokens to generate"
+    required: false
+    default: "8192"
 
 outputs:
   has-changes:
     description: "Whether the translation has changes"
-    value: ${{ steps.translate.outputs.has_changes }}
+    value: ${{ steps.check-changes.outputs.has_changes }}
 
 runs:
   using: "composite"
@@ -41,169 +49,82 @@ runs:
       run: |
         if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^${{ inputs.source-file }}$"; then
           echo "changed=true" >> $GITHUB_OUTPUT
-          git diff HEAD~1 HEAD -- "${{ inputs.source-file }}" > "$RUNNER_TEMP/readme_diff.txt"
-          echo "diff_file=$RUNNER_TEMP/readme_diff.txt" >> $GITHUB_OUTPUT
+          # git diff HEAD~1 HEAD -- "${{ inputs.source-file }}" > "$RUNNER_TEMP/readme_diff.txt"
+          # echo "diff_file=$RUNNER_TEMP/readme_diff.txt" >> $GITHUB_OUTPUT
         else
           echo "changed=false" >> $GITHUB_OUTPUT
         fi
 
-    - name: Translate using GitHub Models AI
+    - name: Translate using AI Inference
       if: steps.check.outputs.changed == 'true'
       id: translate
-      uses: actions/github-script@v7
-      env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
-        DIFF_FILE: ${{ steps.check.outputs.diff_file }}
-        SOURCE_FILE: ${{ inputs.source-file }}
-        TARGET_FILE: ${{ inputs.target-file }}
-        TARGET_LANGUAGE: ${{ inputs.target-language }}
-        MODEL: ${{ inputs.model }}
+      uses: actions/ai-inference@v2
       with:
-        script: |
-          const fs = require('fs');
+        token: ${{ inputs.github-token || inputs.token }}
+        model: ${{ inputs.model }}
+        max-tokens: ${{ inputs.max-tokens }}
+        system-prompt: |
+          You are a professional translator. Your task is to update the TARGET_LANGUAGE translation of a README.md file based on incremental changes.
+          CRITICAL OUTPUT RULES:
+          - Output ONLY the raw markdown content directly.
+          - DO NOT wrap your output in ```markdown or any other code blocks.
+          - DO NOT add any explanations, comments, or notes before or after the content.
+          - Start your response directly with the markdown content.
 
-          const sourceFile = process.env.SOURCE_FILE;
-          const targetFile = process.env.TARGET_FILE;
-          const targetLanguage = process.env.TARGET_LANGUAGE;
-          const model = process.env.MODEL;
+          Translation Instructions:
+          - Keep all markdown formatting, code blocks, links, and technical terms intact.
+          - Add language switch links at the top: [English](SOURCE_FILE) | [TARGET_LANGUAGE](TARGET_FILE)
+          - Only translate natural language text, not code, URLs, or file paths.
+          - Maintain the same structure and formatting as the original.
 
-          // Read source README
-          const readmeContent = fs.readFileSync(sourceFile, 'utf8');
+          Incremental Update Strategy:
+          - Focus on the diff provided - only modify the parts that have changed.
+          - Preserve the existing translation for unchanged sections.
+          - If a section was added, translate only the new section.
+          - If a section was modified, update only that section's translation.
+          - If a section was deleted, remove the corresponding translation.
+        # prompt: ${{steps.check.outputs.diff_file}}
+        prompt-file: ${{ inputs.source-file }}
 
-          // Read diff
-          let diffContent = '';
-          try {
-            diffContent = fs.readFileSync(process.env.DIFF_FILE, 'utf8');
-          } catch {
-            diffContent = 'Unable to read diff';
-          }
+    - name: Process and save translation
+      if: steps.check.outputs.changed == 'true'
+      shell: bash
+      run: |
+        # Get response from response-file (preferred) or response output
+        if [ -n "${{ steps.translate.outputs.response-file }}" ] && [ -f "${{ steps.translate.outputs.response-file }}" ]; then
+          RESPONSE_FILE="${{ steps.translate.outputs.response-file }}"
+        else
+          # Fallback: write response output to temp file for processing
+          RESPONSE_FILE="$RUNNER_TEMP/translation-response.txt"
+          echo "${{ steps.translate.outputs.response }}" > "$RESPONSE_FILE"
+        fi
 
-          // Read existing translation if exists
-          let existingTranslation = '';
-          try {
-            existingTranslation = fs.readFileSync(targetFile, 'utf8');
-          } catch {
-            existingTranslation = '';
-          }
+        # Read the response content
+        TRANSLATED_CONTENT=$(cat "$RESPONSE_FILE")
 
-          // System prompt
-          const systemPrompt = [
-            `You are a professional translator. Your task is to update the ${targetLanguage} translation of a README.md file based on incremental changes.`,
-            '',
-            'CRITICAL OUTPUT RULES:',
-            '- Output ONLY the raw markdown content directly.',
-            '- DO NOT wrap your output in ```markdown or any other code blocks.',
-            '- DO NOT add any explanations, comments, or notes before or after the content.',
-            '- Start your response directly with the markdown content.',
-            '',
-            'Translation Instructions:',
-            '- Keep all markdown formatting, code blocks, links, and technical terms intact.',
-            `- Add language switch links at the top: [English](${sourceFile}) | [${targetLanguage}](${targetFile})`,
-            '- Only translate natural language text, not code, URLs, or file paths.',
-            '- Maintain the same structure and formatting as the original.',
-            '',
-            'Incremental Update Strategy:',
-            '- Focus on the diff provided - only modify the parts that have changed.',
-            '- Preserve the existing translation for unchanged sections.',
-            '- If a section was added, translate only the new section.',
-            '- If a section was modified, update only that section\'s translation.',
-            '- If a section was deleted, remove the corresponding translation.'
-          ].join('\n');
+        # Clean up potential markdown code block wrapping from AI output
+        # Remove leading ```markdown, ```md, or ```
+        TRANSLATED_CONTENT=$(echo "$TRANSLATED_CONTENT" | sed -E '1s/^```(markdown|md)?//')
+        # Remove trailing ```
+        TRANSLATED_CONTENT=$(echo "$TRANSLATED_CONTENT" | sed -E '$s/```$//')
+        # Trim leading and trailing whitespace
+        TRANSLATED_CONTENT=$(echo "$TRANSLATED_CONTENT" | sed -e '1s/^[[:space:]]*//' -e '$s/[[:space:]]*$//')
 
-          // User prompt
-          const userPrompt = existingTranslation ? [
-            '## Task: Incremental Translation Update',
-            '',
-            `The English ${sourceFile} has been updated. Please update ONLY the changed parts in the ${targetLanguage} translation.`,
-            '',
-            `## Changes made to ${sourceFile} (diff):`,
-            '```diff',
-            diffContent,
-            '```',
-            '',
-            `## Current English ${sourceFile} (for reference):`,
-            '```markdown',
-            readmeContent,
-            '```',
-            '',
-            `## Existing ${targetLanguage} translation (${targetFile}) - update this:`,
-            '```markdown',
-            existingTranslation,
-            '```',
-            '',
-            'IMPORTANT: Only modify the sections affected by the diff. Keep all other sections exactly as they are in the existing translation.',
-            `Output the complete updated ${targetLanguage} ${targetFile} content directly (no code blocks wrapping).`
-          ].join('\n') : [
-            '## Task: Full Translation',
-            '',
-            `No existing ${targetLanguage} translation found. Please provide a complete ${targetLanguage} translation.`,
-            '',
-            `## English ${sourceFile} to translate:`,
-            '```markdown',
-            readmeContent,
-            '```',
-            '',
-            `Output the complete ${targetLanguage} ${targetFile} content directly (no code blocks wrapping).`
-          ].join('\n');
+        # Ensure the file ends with a newline
+        if [ -n "$TRANSLATED_CONTENT" ] && [ "${TRANSLATED_CONTENT: -1}" != $'\n' ]; then
+          TRANSLATED_CONTENT="$TRANSLATED_CONTENT"$'\n'
+        fi
 
-          // Call GitHub Models API
-          const response = await fetch('https://models.github.ai/inference/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              model: model,
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-              ],
-              max_tokens: 8192
-            })
-          });
+        # Write to target file (preserve newlines)
+        printf '%s' "$TRANSLATED_CONTENT" > "${{ inputs.target-file }}"
 
-          if (!response.ok) {
-            const error = await response.text();
-            core.setFailed(`GitHub Models API error: ${response.status} - ${error}`);
-            return;
-          }
-
-          const data = await response.json();
-
-          if (!data.choices?.length || !data.choices[0].message?.content) {
-            core.setFailed('Invalid response from GitHub Models API: missing expected content');
-            return;
-          }
-
-          let translatedContent = data.choices[0].message.content;
-
-          // Clean up potential markdown code block wrapping from AI output
-          translatedContent = translatedContent.trim();
-          if (translatedContent.startsWith('```markdown')) {
-            translatedContent = translatedContent.slice('```markdown'.length);
-          } else if (translatedContent.startsWith('```md')) {
-            translatedContent = translatedContent.slice('```md'.length);
-          } else if (translatedContent.startsWith('```')) {
-            translatedContent = translatedContent.slice('```'.length);
-          }
-          if (translatedContent.endsWith('```')) {
-            translatedContent = translatedContent.slice(0, -'```'.length);
-          }
-          translatedContent = translatedContent.trim();
-
-          // Ensure the file ends with a newline
-          if (!translatedContent.endsWith('\n')) {
-            translatedContent += '\n';
-          }
-
-          fs.writeFileSync(targetFile, translatedContent);
-
-          // Check for changes
-          const { execSync } = require('child_process');
-          try {
-            const status = execSync(`git status --porcelain ${targetFile}`, { encoding: 'utf8' }).trim();
-            core.setOutput('has_changes', status.length > 0 ? 'true' : 'false');
-          } catch {
-            core.setOutput('has_changes', 'false');
-          }
+    - name: Check for changes
+      if: steps.check.outputs.changed == 'true'
+      id: check-changes
+      shell: bash
+      run: |
+        if git diff --quiet "${{ inputs.target-file }}" 2>/dev/null; then
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+        fi
